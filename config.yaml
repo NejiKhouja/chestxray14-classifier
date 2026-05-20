@@ -1,0 +1,34 @@
+paths:
+  train_csv:      data/row/archive/train.csv
+  test_csv:       data/row/archive/test.csv
+  image_root:     data/row/archive
+  checkpoint_dir: outputs/checkpoints
+
+training:
+  batch_size:    16
+  num_epochs:    20
+  learning_rate: 0.0001
+  num_workers:   4
+
+model:
+  num_classes: 15
+  pretrained:  true
+
+# ── class weights (capped at 50 for extreme imbalance) ─────────────────────────
+# neg/pos ratio computed in notebooks/exploration.ipynb
+pos_weight:
+  Atelectasis:        9.45
+  Cardiomegaly:      49.68
+  Consolidation:     29.33
+  Edema:             50.00
+  Effusion:           8.99
+  Emphysema:         50.00
+  Fibrosis:          50.00
+  Hernia:            50.00
+  Infiltration:       5.28
+  Mass:              20.46
+  No Finding:         0.71
+  Nodule:            17.38
+  Pleural_Thickening: 37.59
+  Pneumonia:         50.00
+  Pneumothorax:      31.81
