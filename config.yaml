@@ -1,34 +1,31 @@
+# ── paths ──────────────────────────────────────────────────────────────────────
+# Local defaults. On Kaggle, override in train.py (see PATHS block there).
 paths:
-  train_csv:      data/row/archive/train.csv
-  test_csv:       data/row/archive/test.csv
-  image_root:     data/row/archive
+  archive:        E:/archive            # raw NIH download (Data_Entry_2017.csv, *_list.txt, images_*)
+  processed:      data/processed        # preprocess.py writes train/val/test.csv here
+  image_root:     E:/archive            # folder containing the images_XXX/images/ dirs
   checkpoint_dir: outputs/checkpoints
 
+# ── preprocessing (Stage 1) ─────────────────────────────────────────────────────
+preprocess:
+  val_frac:  0.10     # patient-wise validation fraction of train_val
+  nf_ratio:  0.5      # No-Finding images kept per finding image in TRAIN (undersampling)
+  pos_cap:   10.0     # cap on per-class pos_weight
+  seed:      42
+
+# ── training (Stage 2) ──────────────────────────────────────────────────────────
 training:
-  batch_size:    16
-  num_epochs:    20
-  learning_rate: 0.0001
+  batch_size:    32
+  num_epochs:    15
   num_workers:   4
+  img_size:      224
+  lr_backbone:   0.00002
+  lr_head:       0.0002
+  weight_decay:  0.0001
 
+# ── model ───────────────────────────────────────────────────────────────────────
+# 14 pathology classes. "No Finding / Healthy" is derived as 1 - max(probabilities),
+# not a trained class.
 model:
-  num_classes: 15
+  num_classes: 14
   pretrained:  true
-
-# ── class weights (capped at 50 for extreme imbalance) ─────────────────────────
-# neg/pos ratio computed in notebooks/exploration.ipynb
-pos_weight:
-  Atelectasis:        9.45
-  Cardiomegaly:      49.68
-  Consolidation:     29.33
-  Edema:             50.00
-  Effusion:           8.99
-  Emphysema:         50.00
-  Fibrosis:          50.00
-  Hernia:            50.00
-  Infiltration:       5.28
-  Mass:              20.46
-  No Finding:         0.71
-  Nodule:            17.38
-  Pleural_Thickening: 37.59
-  Pneumonia:         50.00
-  Pneumothorax:      31.81

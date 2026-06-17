@@ -1,181 +1,150 @@
 import os
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
-from dataset import ChestXrayDataset, get_transforms
+from dataset import ChestXrayDataset, get_transforms, build_image_index, LABELS, NUM_CLASSES
 from model import ChestXrayModel
 
-# ── config ────────────────────────────────────────────────────────────────────
-# Kaggle paths — adjust if running locally
-TRAIN_CSV      = '/kaggle/input/chest-xray14-preprocessed/train.csv'
-IMAGE_ROOT     = '/kaggle/input/nih-chest-xrays/data'
-CHECKPOINT_DIR = '/kaggle/working/checkpoints'
+TRAIN_CSV  = '/kaggle/working/train.csv'
+VAL_CSV    = '/kaggle/working/val.csv'
+IMAGE_ROOT = '/kaggle/input/nih-chest-xrays/data'
+CKPT_DIR   = '/kaggle/working/checkpoints'
 
-BATCH_SIZE   = 32      # safe for Kaggle P100/T4 with AMP; try 64 if VRAM allows
-NUM_EPOCHS   = 20
-NUM_WORKERS  = 4       # Kaggle allows up to 4 in notebooks
-VAL_SPLIT    = 0.1     # 10% held out for validation
-
-# backbone (pretrained DenseNet) needs a much smaller LR than the new head
+BATCH_SIZE   = 32
+NUM_EPOCHS   = 15
+NUM_WORKERS  = 4
+IMG_SIZE     = 224
 LR_BACKBONE  = 2e-5
 LR_HEAD      = 2e-4
-WEIGHT_DECAY = 1e-4    # AdamW regularization
+WEIGHT_DECAY = 1e-4
+POS_CAP      = 10.0     
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-POS_WEIGHT = torch.tensor([
-     9.4496, 49.6807, 29.3338, 50.0000,  8.9910,
-    50.0000, 50.0000, 50.0000,  5.2785, 20.4563,
-     0.7134, 17.3755, 37.5870, 50.0000, 31.8070
-], dtype=torch.float32).to(DEVICE)
+
+def compute_pos_weight(csv_path, cap=POS_CAP):
+    df = pd.read_csv(csv_path)
+    w = []
+    for label in LABELS:
+        pos = float(df[label].sum())
+        neg = float(len(df) - pos)
+        w.append(min(neg / max(pos, 1.0), cap))
+    return torch.tensor(w, dtype=torch.float32)
 
 
-# ── data ──────────────────────────────────────────────────────────────────────
 def get_loaders():
-    # two instances of the same CSV — one with augmentation, one without
-    # this lets us apply different transforms to train vs val subsets
-    train_full = ChestXrayDataset(TRAIN_CSV, IMAGE_ROOT, transform=get_transforms(train=True))
-    val_full   = ChestXrayDataset(TRAIN_CSV, IMAGE_ROOT, transform=get_transforms(train=False))
-
-    n     = len(train_full)
-    val_n = int(n * VAL_SPLIT)
-    rng   = np.random.default_rng(42)
-    idx   = rng.permutation(n).tolist()
-    train_idx, val_idx = idx[val_n:], idx[:val_n]
-
-    train_ds = Subset(train_full, train_idx)
-    val_ds   = Subset(val_full,   val_idx)
+    # build the filename->path index once and share it across both datasets
+    index = build_image_index(IMAGE_ROOT)
+    train_ds = ChestXrayDataset(TRAIN_CSV, IMAGE_ROOT,
+                                transform=get_transforms(train=True, img_size=IMG_SIZE),
+                                image_index=index)
+    val_ds   = ChestXrayDataset(VAL_CSV, IMAGE_ROOT,
+                                transform=get_transforms(train=False, img_size=IMG_SIZE),
+                                image_index=index)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=True, prefetch_factor=2)
+                              persistent_workers=NUM_WORKERS > 0, prefetch_factor=2 if NUM_WORKERS else None)
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=True, prefetch_factor=2)
+                              persistent_workers=NUM_WORKERS > 0, prefetch_factor=2 if NUM_WORKERS else None)
     return train_loader, val_loader
 
 
-def mean_auc(targets, probs):
-    """Mean AUC-ROC across classes that have at least one positive sample."""
+def per_class_auc(targets, probs):
+    """AUC per class (NaN where a class has no positive in val) + their mean."""
     aucs = []
     for i in range(targets.shape[1]):
-        if targets[:, i].sum() > 0:
+        if 0 < targets[:, i].sum() < len(targets):
             aucs.append(roc_auc_score(targets[:, i], probs[:, i]))
-    return float(np.mean(aucs)) if aucs else 0.0
+        else:
+            aucs.append(float('nan'))
+    mean = float(np.nanmean(aucs))
+    return aucs, mean
 
 
-# ── training loop ─────────────────────────────────────────────────────────────
+@torch.no_grad()
+def evaluate(model, loader, criterion):
+    model.eval()
+    loss_sum, probs, targets = 0.0, [], []
+    for images, ages, genders, y in tqdm(loader, desc="  val", leave=False):
+        images, ages, genders, y = images.to(DEVICE), ages.to(DEVICE), genders.to(DEVICE), y.to(DEVICE)
+        with autocast():
+            logits = model(images, ages, genders)
+            loss_sum += criterion(logits, y).item()
+        probs.append(torch.sigmoid(logits.float()).cpu().numpy())
+        targets.append(y.cpu().numpy())
+    probs, targets = np.concatenate(probs), np.concatenate(targets)
+    aucs, mean = per_class_auc(targets, probs)
+    return loss_sum / len(loader), aucs, mean
+
+
 def train():
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    print(f"Device: {DEVICE} | classes: {NUM_CLASSES}")
 
-    model     = ChestXrayModel(num_classes=15, pretrained=True).to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=POS_WEIGHT)
-    scaler    = GradScaler()
+    model = ChestXrayModel(num_classes=NUM_CLASSES, pretrained=True).to(DEVICE)
+    pos_w = compute_pos_weight(TRAIN_CSV).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+    scaler = GradScaler()
 
-    # differential LRs: backbone is pretrained so it needs tiny updates;
-    # the head is randomly initialized so it needs larger updates
     optimizer = torch.optim.AdamW([
-        {'params': model.features.parameters(),                               'lr': LR_BACKBONE},
+        {'params': model.features.parameters(), 'lr': LR_BACKBONE},
         {'params': list(model.clinical_branch.parameters()) +
-                   list(model.classifier.parameters()),                       'lr': LR_HEAD},
+                   list(model.classifier.parameters()), 'lr': LR_HEAD},
     ], weight_decay=WEIGHT_DECAY)
 
     train_loader, val_loader = get_loaders()
-
-    # OneCycleLR: warms up then anneals over the full run — converges faster than ReduceLROnPlateau
-    # pct_start=0.2 means 20% of batches are warmup, 80% are cooldown
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[LR_BACKBONE, LR_HEAD],
-        epochs=NUM_EPOCHS,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.2,
-    )
+        optimizer, max_lr=[LR_BACKBONE, LR_HEAD],
+        epochs=NUM_EPOCHS, steps_per_epoch=len(train_loader), pct_start=0.2)
 
-    best_auc = 0.0
-    print(f"Device: {DEVICE}")
-    print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)}")
-    print(f"Batches/epoch: {len(train_loader)}")
+    print(f"Train: {len(train_loader.dataset):,} | Val: {len(val_loader.dataset):,} "
+          f"| Batches/epoch: {len(train_loader)}")
     print("-" * 60)
 
+    best_auc = 0.0
     for epoch in range(NUM_EPOCHS):
-
-        # ── train ─────────────────────────────────────────────────────────────
         model.train()
-        train_loss = 0.0
-
-        for images, ages, genders, targets in tqdm(train_loader, desc=f"Epoch {epoch+1:02d}/{NUM_EPOCHS} train"):
-            images, ages, genders, targets = (
-                images.to(DEVICE), ages.to(DEVICE), genders.to(DEVICE), targets.to(DEVICE)
-            )
+        running = 0.0
+        for images, ages, genders, y in tqdm(train_loader, desc=f"Epoch {epoch+1:02d}/{NUM_EPOCHS}"):
+            images, ages, genders, y = images.to(DEVICE), ages.to(DEVICE), genders.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
-
             with autocast():
-                loss = criterion(model(images, ages, genders), targets)
-
+                loss = criterion(model(images, ages, genders), y)
             scaler.scale(loss).backward()
-            # clip gradients — high pos_weights can cause loss spikes → exploding gradients
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()   # OneCycleLR updates every batch, not every epoch
+            scheduler.step()
+            running += loss.item()
+        train_loss = running / len(train_loader)
 
-            train_loss += loss.item()
+        val_loss, aucs, mean_auc = evaluate(model, val_loader, criterion)
+        print(f"Epoch {epoch+1:02d} | train_loss {train_loss:.4f} | "
+              f"val_loss {val_loss:.4f} | mean_AUC {mean_auc:.4f}")
 
-        train_loss /= len(train_loader)
+        if val_loss == val_loss and (epoch == NUM_EPOCHS - 1 or mean_auc > best_auc):
+            # print the per-class breakdown on the best/last epoch
+            worst = sorted(zip(LABELS, aucs), key=lambda t: (t[1] != t[1], t[1]))[:5]
+            print("   weakest classes:", ", ".join(f"{l} {a:.2f}" for l, a in worst))
 
-        # ── validate ──────────────────────────────────────────────────────────
-        model.eval()
-        val_loss    = 0.0
-        all_probs   = []
-        all_targets = []
+        if mean_auc > best_auc:
+            best_auc = mean_auc
+            torch.save({'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
+                        'val_auc': mean_auc, 'per_class_auc': dict(zip(LABELS, aucs)),
+                        'labels': LABELS},
+                       os.path.join(CKPT_DIR, 'model_best.pth'))
+            print(f"   ✓ saved best (mean AUC {best_auc:.4f})")
 
-        with torch.no_grad():
-            for images, ages, genders, targets in tqdm(val_loader, desc=f"Epoch {epoch+1:02d}/{NUM_EPOCHS} val  "):
-                images, ages, genders, targets = (
-                    images.to(DEVICE), ages.to(DEVICE), genders.to(DEVICE), targets.to(DEVICE)
-                )
-                with autocast():
-                    logits = model(images, ages, genders)
-                    val_loss += criterion(logits, targets).item()
-
-                all_probs.append(torch.sigmoid(logits).cpu().numpy())
-                all_targets.append(targets.cpu().numpy())
-
-        val_loss   /= len(val_loader)
-        val_auc     = mean_auc(np.concatenate(all_targets), np.concatenate(all_probs))
-
-        print(f"Epoch {epoch+1:02d} | train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f} | val_AUC: {val_auc:.4f}")
-
-        # save best checkpoint (by val AUC, not by loss)
-        if val_auc > best_auc:
-            best_auc = val_auc
-            torch.save({
-                'epoch':             epoch + 1,
-                'model_state_dict':  model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss':          val_loss,
-                'val_auc':           val_auc,
-            }, os.path.join(CHECKPOINT_DIR, 'model_best.pth'))
-            print(f"  ✓ best checkpoint (AUC {best_auc:.4f})")
-
-        # also keep a periodic checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
-            torch.save({
-                'epoch':             epoch + 1,
-                'model_state_dict':  model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss':          val_loss,
-                'val_auc':           val_auc,
-            }, os.path.join(CHECKPOINT_DIR, f'model_epoch{epoch+1}.pth'))
-
-    print(f"\nDone. Best val AUC: {best_auc:.4f}")
+    print(f"\nDone. Best mean val AUC: {best_auc:.4f}")
 
 
 if __name__ == '__main__':

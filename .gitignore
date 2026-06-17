@@ -1,10 +1,7 @@
 # Secrets
 .env
-
+.claude
 # Model checkpoints (too large for GitHub)
-outputs/checkpoints/
-*.pth
-*.pt
 
 # Python
 __pycache__/
@@ -14,12 +11,4 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Data
-data/
 
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
-.DS_Store
-Thumbs.db

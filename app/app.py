@@ -11,9 +11,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 load_dotenv(os.path.join(_HERE, '..', '.env'))
 
-from utils import load_model, preprocess, predict, get_gradcam, explain_with_groq, LABELS
+from utils import load_model, preprocess, predict, get_gradcam, explain_with_groq, healthy_verdict, LABELS
 
-CHECKPOINT = os.path.join(_HERE, '..', 'outputs', 'checkpoints', 'model_epoch5.pth')
+CHECKPOINT = os.path.join(_HERE, '..', 'outputs', 'checkpoints', 'model_best.pth')
 
 # page config
 st.set_page_config(page_title='ChestX-ray14 Classifier', layout='wide')
@@ -27,8 +27,8 @@ with st.sidebar:
     threshold = st.slider('Detection threshold', 0.1, 0.9, 0.5, 0.05)
     st.markdown('---')
     st.markdown('**Model:** DenseNet-121 + clinical features')
-    st.markdown('**Classes:** 15 chest pathologies')
-    st.markdown('**Checkpoint:** epoch 5 (partial training)')
+    st.markdown('**Classes:** 14 chest pathologies')
+    st.markdown('**Healthy verdict:** derived as 1 − max(probabilities)')
 
 # load model once 
 @st.cache_resource
@@ -37,13 +37,13 @@ def get_model():
         return None, None, None
     return load_model(CHECKPOINT)
 
-model, epoch, loss = get_model()
+model, epoch, val_auc = get_model()
 
 if model is None:
     st.error(f'Checkpoint not found at: {CHECKPOINT}')
     st.stop()
 
-st.sidebar.success(f'Loaded: epoch {epoch}, loss {loss:.4f}')
+st.sidebar.success(f'Loaded: epoch {epoch}, val AUC {val_auc:.4f}')
 
 #inputs 
 col1, col2 = st.columns([1, 2])
@@ -68,8 +68,19 @@ if run_btn and uploaded is not None:
     with st.spinner('Computing GradCAM...'):
         cam = get_gradcam(model, image_t, age_t, gender_t, top_class)
 
+    no_finding, is_healthy, flagged = healthy_verdict(probs, threshold)
+
     with col2:
         st.subheader('Results')
+
+        # headline healthy / abnormal verdict
+        vcol1, vcol2 = st.columns(2)
+        vcol1.metric('No Finding / Healthy score', f'{no_finding:.0%}')
+        if is_healthy:
+            vcol2.success('Verdict: likely HEALTHY\n\nNo pathology above threshold.')
+        else:
+            vcol2.warning('Verdict: ABNORMAL\n\n' + ', '.join(f'{l} ({p:.0%})' for l, p in flagged))
+
         tab_cam, tab_probs, tab_llm = st.tabs(['GradCAM', 'Probabilities', 'LLM Explanation'])
 
         # GradCAM tab

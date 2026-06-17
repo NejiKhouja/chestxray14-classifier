@@ -1,91 +1,82 @@
+
 import os
 import pandas as pd
-import numpy as np
-from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-# the 15 conditions in a fixed order
+# The 14 pathology classes, in a fixed canonical order. "No Finding" is excluded.
 LABELS = [
-    'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema',
-    'Effusion', 'Emphysema', 'Fibrosis', 'Hernia', 'Infiltration',
-    'Mass', 'No Finding', 'Nodule', 'Pleural_Thickening',
-    'Pneumonia', 'Pneumothorax'
+    'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Effusion',
+    'Emphysema', 'Fibrosis', 'Hernia', 'Infiltration', 'Mass',
+    'Nodule', 'Pleural_Thickening', 'Pneumonia', 'Pneumothorax',
 ]
+NUM_CLASSES = len(LABELS)
 
-IMAGE_DIRS = [
-    f'images_{str(i).zfill(3)}/images' for i in range(1, 13)
-]
+# ImageNet normalization (DenseNet was pretrained on these statistics)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def build_image_index(image_root):
+    """
+    Walk image_root once and map every '*.png' filename -> absolute path.
+
+    Works for any layout (Kaggle's images_XXX/images/, a flat folder, etc.)
+    so we never have to guess the directory structure.
+    """
+    index = {}
+    for dirpath, _, filenames in os.walk(image_root):
+        for fn in filenames:
+            if fn.lower().endswith('.png'):
+                index[fn] = os.path.join(dirpath, fn)
+    if not index:
+        raise FileNotFoundError(f"No .png images found under {image_root}")
+    return index
+
 
 class ChestXrayDataset(Dataset):
-    def __init__(self, csv_path, image_root, transform=None):
+    def __init__(self, csv_path, image_root, transform=None, image_index=None):
         self.df = pd.read_csv(csv_path)
-        self.image_root = image_root
         self.transform = transform
+        # build (or reuse) the filename -> path lookup once, not per __getitem__
+        self.image_index = image_index if image_index is not None else build_image_index(image_root)
+        # cache label columns as a numpy matrix for fast row access
+        self._labels = self.df[LABELS].values.astype('float32')
+        self._ages = self.df['Patient Age'].values.astype('float32')
+        self._genders = self.df['Patient Gender'].values.astype('float32')
+        self._files = self.df['Image Index'].values
 
     def __len__(self):
         return len(self.df)
 
-    def _find_image(self, filename):
-        for folder in IMAGE_DIRS:
-            path = os.path.join(self.image_root, folder, filename)
-            if os.path.exists(path):
-                return path
-        raise FileNotFoundError(f"Image not found: {filename}")
-
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        from PIL import Image
 
-        # load image
-        img_path = self._find_image(row['Image Index'])
-        image = Image.open(img_path).convert('RGB')
+        path = self.image_index[self._files[idx]]
+        image = Image.open(path).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
-        # multi-label target vector
-        label_str = row['Finding Labels']
-        target = torch.zeros(len(LABELS), dtype=torch.float32)
-        for i, label in enumerate(LABELS):
-            if label in label_str:
-                target[i] = 1.0
-
-        # clinical features
-        age = torch.tensor([row['Patient Age']], dtype=torch.float32)
-        gender = torch.tensor([row['Patient Gender']], dtype=torch.float32)
-
+        target = torch.from_numpy(self._labels[idx])
+        age    = torch.tensor([self._ages[idx]], dtype=torch.float32)
+        gender = torch.tensor([self._genders[idx]], dtype=torch.float32)
         return image, age, gender, target
 
 
-def get_transforms(train=True):
+def get_transforms(train=True, img_size=224):
     if train:
         return transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((img_size, img_size)),
             transforms.RandomHorizontalFlip(),
-            # affine combines rotation + small translation + scale in one pass
-            transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomAffine(degrees=7, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-            # randomly erase a small patch — forces model to not rely on any single region
-            transforms.RandomErasing(p=0.3, scale=(0.02, 0.08)),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.08)),
         ])
-    else:
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-if __name__ == '__main__':
-    dataset = ChestXrayDataset(
-        csv_path=r'C:\Users\deadx\OneDrive\Desktop\ChestX-ray14\data\row\train.csv',
-        image_root=r'C:\Users\deadx\OneDrive\Desktop\ChestX-ray14\data\row\archive',
-        transform=get_transforms(train=True)
-    )
-    image, age, gender, target = dataset[0]
-    print(f"Image shape: {image.shape}")
-    print(f"Age: {age}, Gender: {gender}")
-    print(f"Target: {target}")
-    print(f"Dataset size: {len(dataset)}")
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])

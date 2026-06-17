@@ -1,43 +1,80 @@
 # ChestX-ray14 Multi-label Classifier
 
-Fine-tuning **DenseNet-121** on the NIH ChestX-ray14 dataset for multi-label classification of 15 chest pathologies, with a multi-modal architecture that fuses image features with patient clinical data (age + gender).
+Fine-tuning **DenseNet-121** on the NIH ChestX-ray14 dataset for multi-label classification of **14 chest pathologies**, with a multi-modal architecture that fuses image features with patient clinical data (age + gender).
 
 > **Research/educational project — not for clinical use.**
 
 ---
 
-## Features
+## What's the approach?
 
-| Feature | Details |
-|---|---|
-| **Model** | DenseNet-121 backbone + clinical branch (age, gender) |
-| **Classes** | 15 chest pathologies (Atelectasis, Cardiomegaly, …, Pneumothorax) |
-| **Demo app** | Streamlit — upload X-ray → predictions + GradCAM + LLM explanation |
-| **LLM** | Groq (`llama-3.3-70b-versatile`) explains predictions in plain language |
-| **Evaluation** | Jupyter notebook — AUC-ROC per class, GradCAM visualization |
+Two design choices drive better, cleaner results:
+
+1. **14 pathology classes, not 15.** "No Finding" is *not* a trained class — it competes with real pathologies and (at 54% of images) drowns the rare ones. Instead, **a healthy scan is the absence of all 14 findings**, and we report a derived verdict:
+
+   > **`No Finding / Healthy score = 1 − max(pathology probabilities)`**
+
+   So the model still answers *"is this chest X-ray healthy?"* — it just does it the principled way that matches published CheXNet baselines.
+
+2. **Undersample the majority.** 53.8% of images are healthy, which swamps the learning signal. Preprocessing **undersamples No-Finding images in the training set only** (keeping ~0.5 healthy per finding image), dropping healthy share from ~58% → ~33%. Validation and test keep their natural distribution for honest evaluation.
 
 ---
 
-## Project Structure
+## The 14 classes
+
+`Atelectasis, Cardiomegaly, Consolidation, Edema, Effusion, Emphysema, Fibrosis, Hernia, Infiltration, Mass, Nodule, Pleural_Thickening, Pneumonia, Pneumothorax`
+
+Outputs are independent sigmoids (multi-label), not softmax — a single image can show several conditions at once.
+
+---
+
+## Pipeline
+
+```
+raw NIH archive  (Data_Entry_2017.csv, train_val_list.txt, test_list.txt, images_*/)
+        │
+        ▼
+[src/preprocess.py]   clean ages, encode gender, normalize age, expand 14 labels,
+        │             official patient-wise split, UNDERSAMPLE No-Finding (train only)
+        ▼
+train.csv / val.csv / test.csv
+        │
+        ▼
+[src/train.py]        DenseNet-121 + clinical branch, auto pos_weight, AMP,
+        │             differential LR + OneCycle, per-class AUC, best checkpoint
+        ▼
+outputs/checkpoints/model_best.pth
+        │
+        ├──► [notebooks/train_kaggle.ipynb]   one self-contained notebook that runs
+        │                                      the WHOLE pipeline + evaluation on Kaggle
+        │
+        └──► [app/app.py]                      Streamlit demo: upload X-ray →
+                                               healthy/abnormal verdict + GradCAM + LLM
+```
+
+Each stage is independent: re-run preprocessing without touching training, or update the app without retraining. `config.yaml` holds shared paths and hyperparameters.
+
+---
+
+## Project structure
 
 ```
 ChestX-ray14/
 ├── src/
-│   ├── model.py          # DenseNet-121 + clinical fusion architecture
-│   ├── dataset.py        # Dataset class, transforms, label definitions
-│   └── train.py          # Training loop (mixed precision, checkpointing)
-├── app/
-│   ├── app.py            # Streamlit demo app
-│   └── utils.py          # Shared helpers: load_model, predict, GradCAM, Groq
+│   ├── preprocess.py     # Stage 1 — clean + split + undersample → train/val/test.csv
+│   ├── dataset.py        # Dataset, transforms, the 14 LABELS
+│   ├── model.py          # DenseNet-121 + clinical fusion
+│   └── train.py          # Stage 2 — training loop, auto pos_weight, per-class AUC
 ├── notebooks/
-│   ├── exploration.ipynb # EDA, preprocessing, class weight calculation
-│   └── evaluate.ipynb    # Checkpoint evaluation, AUC-ROC, GradCAM, LLM
-├── outputs/
-│   └── checkpoints/
-│       └── model_epoch5.pth
-├── config.yaml           # Hyperparameters and paths
+│   ├── exploration.ipynb   # EDA — label balance, co-occurrence, age/gender, samples
+│   ├── preprocessing.ipynb # visual walk-through of the preprocessing pipeline
+│   └── train_kaggle.ipynb  # self-contained: preprocess → train → evaluate (Kaggle-ready)
+├── app/
+│   ├── app.py            # Streamlit demo (healthy verdict + GradCAM + Groq)
+│   └── utils.py          # load_model, predict, healthy_verdict, GradCAM, Groq
+├── config.yaml           # paths + hyperparameters
 ├── requirements.txt
-└── .env.example          # Copy to .env and add GROQ_API_KEY
+└── .env.example          # copy to .env, add GROQ_API_KEY
 ```
 
 ---
@@ -47,201 +84,80 @@ ChestX-ray14/
 ```
 Image (224×224) ──► DenseNet-121 features ──► GAP ──► 1024-dim
                                                               │
-Age, Gender ──────► FC(2→16) → ReLU → Dropout ──► 16-dim   │
+Age, Gender ──────► FC(2→16) → ReLU → Dropout ──► 16-dim     │
                                                               ▼
-                                              Concat → FC(1040→512) → FC(512→15)
+                                              Concat → FC(1040→512) → FC(512→14)
 ```
-
-The final 15 logits are passed through sigmoid for multi-label prediction.  
-Sigmoid (not softmax) is used because a single image can show multiple conditions simultaneously — each class is treated as an independent binary prediction.
 
 ---
 
-## The ML Pipeline
+## Quick start — Kaggle (recommended)
 
-The project follows a linear pipeline from raw data to interactive demo. Each stage feeds into the next.
+The fastest path is the self-contained notebook:
 
-```
-Raw Dataset
-    │
-    ▼
-[exploration.ipynb]  ←── EDA, clean age outliers, encode gender,
-    │                     normalize age, split train/test, save CSVs
-    ▼
-train.csv / test.csv
-    │
-    ▼
-[src/train.py]       ←── load data, fine-tune DenseNet-121,
-    │                     save checkpoint every 5 epochs
-    ▼
-outputs/checkpoints/model_epoch5.pth
-    │
-    ├──► [notebooks/evaluate.ipynb]  ←── load checkpoint, compute AUC-ROC,
-    │                                     visualize GradCAM, call Groq
-    │
-    └──► [app/app.py]                ←── interactive Streamlit demo,
-                                          upload image → predictions → LLM
-```
+1. New Kaggle notebook → **Add Data** → [NIH Chest X-rays](https://www.kaggle.com/datasets/nih-chest-xrays/data).
+2. Upload `notebooks/train_kaggle.ipynb`.
+3. Enable GPU (T4/P100) → **Run All**.
 
-**Why this structure?**  
-Each stage is isolated — you can re-run just training without touching the app, or update the app logic without retraining. The `config.yaml` holds all shared paths and hyperparameters so nothing is hardcoded in multiple places.
-
-### Stage 1 — Preprocessing (`exploration.ipynb`)
-
-The raw CSV from NIH has two issues that must be fixed before training:
-
-- **Age outliers**: a few entries have impossible ages (e.g., age > 120). These are dropped.
-- **Gender as string**: the model expects a float tensor. `M → 0`, `F → 1`.
-- **Age scale**: raw ages (0–100+) fed directly into a neural network create unstable gradients because they dwarf all other activations. Dividing by 100 puts age in the same `[0, 1]` range as normalized image pixels.
-
-The notebook then splits images into train/test using the official NIH split files (`train_val_list.txt`, `test_list.txt`) and saves clean CSVs.
-
-### Stage 2 — Training (`src/train.py`)
-
-Three techniques handle the core challenges of this dataset:
-
-**Class imbalance** — "Hernia" appears in only 141 of 86,512 training images (0.16%). Without correction, the model would just never predict it. `BCEWithLogitsLoss(pos_weight=...)` scales the loss for positive samples of each class — rare diseases contribute more to the gradient. Weights are capped at 50 to prevent extreme classes from dominating training.
-
-**Compute efficiency** — Mixed precision training (`torch.cuda.amp`) stores activations in float16 instead of float32, roughly halving GPU memory use and speeding up training on modern GPUs, with no meaningful accuracy loss.
-
-**Checkpointing** — A full DenseNet-121 training run takes hours. Saving every 5 epochs means if training is interrupted, it can resume from the last checkpoint rather than starting over.
-
-### Stage 3 — Evaluation (`notebooks/evaluate.ipynb`)
-
-**AUC-ROC** is the standard metric for this dataset because it measures ranking quality regardless of threshold — it answers "does the model rank sick patients higher than healthy ones?" rather than "did it guess right at 50%?". A score of 0.5 means random; published DenseNet baselines on this dataset reach ~0.80 mean AUC with full training.
-
-The notebook also runs **GradCAM** (see below) on a sample image so you can visually sanity-check whether the model is looking at the right parts of the image.
+It locates the dataset automatically, preprocesses, trains for 15 epochs, and prints a per-class AUC table plus the derived **healthy/abnormal detector AUC**. The best checkpoint lands in `/kaggle/working/checkpoints/model_best.pth`.
 
 ---
 
-## GradCAM — How It Works
-
-GradCAM (Gradient-weighted Class Activation Mapping) answers: *"which pixels made the model predict this disease?"*
-
-**The idea in plain terms:** the model's last convolutional layer produces a set of feature maps — each one detecting a different visual pattern. GradCAM asks "which of these feature maps mattered most for predicting class X?" by computing how much the class score changes when each feature map changes (i.e., the gradient). It then blends those feature maps together weighted by their importance, producing a single heatmap.
-
-**In this project:**  
-The target layer is `model.features.denseblock4` — the last dense block before global average pooling, where the feature maps are still spatially meaningful (7×7 grid over the original 224×224 image). After that, GAP collapses spatial information, so GradCAM would have nothing to look at.
-
-```python
-# simplified flow
-output[0, class_idx].backward()         # compute gradients for one class
-weights = gradients.mean(over H and W)  # importance of each feature map channel
-cam     = relu(sum(weights * activations))  # weighted blend, ignore negatives
-```
-
-The resulting heatmap is resized back to 224×224 and overlaid on the original image. Red regions drove the prediction; blue regions were irrelevant.
-
-**Why include it?**  
-In medical imaging, a model that gives the right answer for the wrong reason is dangerous. GradCAM lets you check that the model is actually looking at the lung fields and not at artifacts like scanner labels or patient markers.
-
----
-
-## LLM Integration — How and Why
-
-### How it works
-
-After the model produces a probability vector (15 floats, one per disease), that vector is formatted into a structured text prompt and sent to Groq's API. Groq runs `llama-3.3-70b-versatile` — a large language model — which reads the probabilities and writes a short plain-language interpretation.
-
-```
-Model output (15 floats)
-        │
-        ▼
-[app/utils.py — explain_with_groq()]
-        │  builds a prompt like:
-        │  "Findings above 50%: Infiltration (67%), Atelectasis (54%)
-        │   All probabilities: ...
-        │   Explain in 2-3 sentences for a medical student."
-        │
-        ▼
-Groq API  (llama-3.3-70b-versatile, max 220 tokens)
-        │
-        ▼
-Plain-language explanation shown in Streamlit / notebook
-```
-
-### Why Groq specifically?
-
-Groq runs LLMs on custom hardware (LPUs — Language Processing Units) that are significantly faster than GPU-based inference. Response times are typically under 1 second, which is important for a real-time demo app — waiting 10 seconds for an explanation after already waiting for model inference would break the user experience.
-
-The `llama-3.3-70b-versatile` model was chosen because it has strong reasoning and medical knowledge from its training data, while still being fast enough on Groq hardware.
-
-### Why add an LLM at all?
-
-A raw probability vector like `[0.12, 0.03, 0.67, ...]` is not useful to most people. The LLM bridges the gap between the model's numerical output and a human-readable interpretation. This pattern — a task-specific model producing structured output, an LLM turning it into natural language — is increasingly common in applied AI systems.
-
-It also makes the project more honest: the LLM is explicitly prompted to remind the reader that the model is partially trained and not clinically valid. The explanation is interpretive, not diagnostic.
-
-**Important:** the LLM does not have access to the image. It only sees the probability scores. It cannot "look" at the X-ray — it is purely translating numbers into words.
-
----
-
-## Setup
+## Quick start — local / scripts
 
 ```bash
-# 1. install dependencies
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118  # GPU
 pip install -r requirements.txt
 
-# 2. add your Groq API key
-cp .env.example .env
-# edit .env and set GROQ_API_KEY=gsk_...
+# Stage 1 — preprocess (writes train/val/test.csv + prints pos_weights)
+python src/preprocess.py --archive E:/archive --out data/processed
 
-# 3. download the dataset
-# https://nihcc.app.box.com/v/ChestXray-NIHCC
-# place images in data/row/archive/images_001/ … images_012/
-# place Data_Entry_2017.csv, train_val_list.txt, test_list.txt in data/row/archive/
-
-# 4. run data preprocessing
-jupyter notebook notebooks/exploration.ipynb
+# Stage 2 — train (edit the PATHS block at the top of train.py first)
+python src/train.py
 ```
+
+`preprocess.py` flags: `--nf-ratio` (No-Finding undersampling, default 0.5), `--val-frac` (default 0.10), `--pos-cap` (default 10).
 
 ---
 
-## Training
+## Training details
 
-```bash
-cd src
-python train.py
-```
+| Technique | Why |
+|---|---|
+| **Undersampling + auto `pos_weight`** | Undersampling fixes the healthy-vs-sick imbalance; per-class `pos_weight` (computed from `train.csv`, capped at 10) handles residual rare-disease imbalance without the over-prediction that an uncapped weight causes. |
+| **Differential learning rates** | Pretrained backbone gets a tiny LR (2e-5); the new head gets a larger one (2e-4). |
+| **OneCycleLR + AMP + grad clipping** | Fast, stable convergence; float16 activations halve GPU memory. |
+| **Best-checkpoint by mean val AUC** | Saved with per-class AUC so you can see exactly which pathologies are learning. |
 
-Checkpoints are saved every 5 epochs to `outputs/checkpoints/`.
+Published DenseNet baselines reach ~0.80 mean AUC with full training.
 
 ---
 
-## Streamlit Demo
+## Streamlit demo
 
 ```bash
+cp .env.example .env          # add GROQ_API_KEY=gsk_...
 streamlit run app/app.py
 ```
 
-1. Upload a chest X-ray image (PNG or JPEG)
-2. Enter patient age and gender
-3. Click **Analyze**
-4. View GradCAM heatmap, probability chart, and Groq LLM explanation
+Upload an X-ray + age/gender → headline **Healthy / Abnormal verdict**, GradCAM heatmap, per-class probabilities, and a plain-language Groq explanation.
 
 ---
 
-## Evaluation Notebook
+## GradCAM
 
-```bash
-jupyter notebook notebooks/evaluate.ipynb
-```
+Answers *"which pixels drove this prediction?"* by weighting the last dense block's feature maps (`model.features.denseblock4`, a 7×7 grid) by their gradient w.r.t. the target class, then overlaying the heatmap on the image. In medical imaging this is a sanity check that the model looks at lung fields, not scanner labels.
 
-- Loads the saved checkpoint
-- Runs batch inference on the test set (or a subset via `MAX_SAMPLES`)
-- Computes per-class AUC-ROC
-- Visualizes GradCAM for a sample image
-- Gets a plain-language explanation from Groq
+---
+
+## LLM explanation (Groq)
+
+After inference, the 14 probabilities **and the derived healthy score** are formatted into a prompt and sent to Groq (`llama-3.3-70b-versatile`, sub-second on their LPU hardware) for a short plain-language interpretation. The LLM only sees the numbers — it cannot look at the image — and is prompted to remind the reader that the model is partially trained and not clinically valid.
 
 ---
 
 ## Dataset
 
-NIH Clinical Center — ChestX-ray14  
-112,120 frontal-view X-ray images from 30,805 unique patients  
+NIH Clinical Center — ChestX-ray14 · 112,120 frontal X-rays from 30,805 patients
 Source: <https://nihcc.app.box.com/v/ChestXray-NIHCC>
 
-**Encoding used in preprocessing (`exploration.ipynb`):**
-- `Patient Gender`: M → 0, F → 1
-- `Patient Age`: raw_age / 100.0
+**Preprocessing encodings:** Gender `M→0, F→1` · Age `raw/100` · ages > 100 dropped · official patient-wise train/val/test split.

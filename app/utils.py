@@ -25,12 +25,27 @@ _TRANSFORM = transforms.Compose([
 
 
 def load_model(checkpoint_path):
-    """Load DenseNet model from a training checkpoint."""
-    model = ChestXrayModel(num_classes=15, pretrained=False)
+    """Load the DenseNet model (14 classes) from a training checkpoint."""
+    model = ChestXrayModel(num_classes=len(LABELS), pretrained=False)
     ckpt = torch.load(checkpoint_path, map_location=DEVICE)
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(DEVICE).eval()
-    return model, ckpt.get('epoch', '?'), ckpt.get('loss', float('nan'))
+    return model, ckpt.get('epoch', '?'), ckpt.get('val_auc', float('nan'))
+
+
+def healthy_verdict(probs, threshold=0.5):
+    """
+    Derive a healthy / abnormal verdict from the 14 pathology probabilities.
+    'No Finding' is not a trained class — a healthy scan is the absence of all 14.
+    Returns (no_finding_score, is_healthy, flagged) where flagged is a list of
+    (label, prob) above threshold, sorted high-to-low.
+    """
+    no_finding = float(1.0 - probs.max())
+    flagged = sorted(
+        [(LABELS[i], float(probs[i])) for i in range(len(LABELS)) if probs[i] >= threshold],
+        key=lambda t: -t[1],
+    )
+    return no_finding, len(flagged) == 0, flagged
 
 
 def preprocess(image_pil, age_raw, gender_str):
@@ -112,9 +127,11 @@ def explain_with_groq(probs, api_key):
     ]
     findings_str = ', '.join(findings) if findings else 'No significant findings'
     all_probs    = '\n'.join(f'  - {LABELS[i]}: {probs[i]:.1%}' for i in range(len(LABELS)))
+    no_finding   = 1.0 - probs.max()
 
     prompt = f"""A chest X-ray classifier (research/educational demo, NOT clinical) produced:
 
+Healthy / No Finding score: {no_finding:.0%}
 Findings above 50% threshold: {findings_str}
 
 All class probabilities:
